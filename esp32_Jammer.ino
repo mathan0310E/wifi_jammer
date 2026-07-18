@@ -51,12 +51,11 @@ uint8_t disassocFrame[26] = {
 
 uint8_t beaconFrame[128];
 
-enum AttackMode : uint8_t {
-  MODE_DEAUTH = 0,
-  MODE_DISASSOC = 1,
-  MODE_BOTH = 2,
-  MODE_BEACON = 3
-};
+// No custom enum type — Arduino IDE inserts prototypes before enums and breaks compile
+#define MODE_DEAUTH    0
+#define MODE_DISASSOC  1
+#define MODE_BOTH      2
+#define MODE_BEACON    3
 
 struct NetInfo {
   String  ssid;
@@ -64,7 +63,7 @@ struct NetInfo {
   String  bssidStr;
   uint8_t channel;
   int32_t rssi;
-  wifi_auth_mode_t enc;
+  int     enc;
   bool selected;
 };
 
@@ -72,7 +71,7 @@ NetInfo nets[MAX_SCAN];
 int scannedCount = 0;
 
 bool attacking = false;
-AttackMode attackMode = MODE_BOTH;
+int attackMode = MODE_BOTH;
 int intensity = 8;
 unsigned long packetsSent = 0;
 unsigned long attackStartMs = 0;
@@ -82,8 +81,8 @@ unsigned long pktsWindow = 0;
 int currentAttackCh = 1;
 String attackLabel = "";
 
-// IMPORTANT: must be "const char *" (pointer). "const char" alone causes compile errors.
-const char * encName(wifi_auth_mode_t m) {
+// Use int/uint8_t in signatures — Arduino auto-prototypes break on custom enums.
+const char * encName(int m) {
   switch (m) {
     case WIFI_AUTH_OPEN:            return "OPEN";
     case WIFI_AUTH_WEP:             return "WEP";
@@ -101,7 +100,7 @@ const char * encName(wifi_auth_mode_t m) {
   }
 }
 
-const char * getModeName(AttackMode m) {
+const char * getModeName(int m) {
   switch (m) {
     case MODE_DEAUTH:   return "DEAUTH";
     case MODE_DISASSOC: return "DISASSOC";
@@ -426,7 +425,7 @@ void handleStop() {
 void handleSettings() {
   if (server.hasArg("mode")) {
     int m = server.arg("mode").toInt();
-    if (m >= 0 && m <= 3) attackMode = (AttackMode)m;
+    if (m >= 0 && m <= 3) attackMode = m;
   }
   if (server.hasArg("int")) {
     intensity = constrain(server.arg("int").toInt(), 1, 32);
