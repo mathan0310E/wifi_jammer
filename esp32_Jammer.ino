@@ -1,4 +1,5 @@
 
+
 #include <WiFi.h>
 #include <WebServer.h>
 #include <DNSServer.h>
@@ -20,6 +21,7 @@
 #endif
 
 const char* AP_SSID = "Wolf Attacker";
+// WPA2 SoftAP password must be at least 8 characters ("Tamil" alone is too short)
 const char* AP_PASS = "Tamil123";
 
 DNSServer dnsServer;
@@ -49,7 +51,12 @@ uint8_t disassocFrame[26] = {
 
 uint8_t beaconFrame[128];
 
-enum AttackMode { MODE_DEAUTH = 0, MODE_DISASSOC = 1, MODE_BOTH = 2, MODE_BEACON = 3 };
+enum AttackMode : uint8_t {
+  MODE_DEAUTH = 0,
+  MODE_DISASSOC = 1,
+  MODE_BOTH = 2,
+  MODE_BEACON = 3
+};
 
 struct NetInfo {
   String  ssid;
@@ -75,7 +82,8 @@ unsigned long pktsWindow = 0;
 int currentAttackCh = 1;
 String attackLabel = "";
 
-const char* encName(wifi_auth_mode_t m) {
+// IMPORTANT: must be "const char *" (pointer). "const char" alone causes compile errors.
+const char * encName(wifi_auth_mode_t m) {
   switch (m) {
     case WIFI_AUTH_OPEN:            return "OPEN";
     case WIFI_AUTH_WEP:             return "WEP";
@@ -83,13 +91,17 @@ const char* encName(wifi_auth_mode_t m) {
     case WIFI_AUTH_WPA2_PSK:        return "WPA2";
     case WIFI_AUTH_WPA_WPA2_PSK:    return "WPA/WPA2";
     case WIFI_AUTH_WPA2_ENTERPRISE: return "WPA2-E";
+#ifdef WIFI_AUTH_WPA3_PSK
     case WIFI_AUTH_WPA3_PSK:        return "WPA3";
+#endif
+#ifdef WIFI_AUTH_WPA2_WPA3_PSK
     case WIFI_AUTH_WPA2_WPA3_PSK:   return "WPA2/3";
+#endif
     default:                        return "?";
   }
 }
 
-const char* modeName(AttackMode m) {
+const char * getModeName(AttackMode m) {
   switch (m) {
     case MODE_DEAUTH:   return "DEAUTH";
     case MODE_DISASSOC: return "DISASSOC";
@@ -312,7 +324,7 @@ String htmlPage() {
   p += F("<div class='card'>");
   if (attacking) {
     p += F("<div class='status on'>ATTACKING &mdash; ");
-    p += modeName(attackMode);
+    p += getModeName(attackMode);
     p += F(" &mdash; ");
     p += htmlEscape(attackLabel);
     p += F("</div>");
