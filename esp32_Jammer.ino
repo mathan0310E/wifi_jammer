@@ -1,5 +1,4 @@
 
-
 #include <WiFi.h>
 #include <WebServer.h>
 #include <DNSServer.h>
@@ -28,8 +27,11 @@ DNSServer dnsServer;
 WebServer server(80);
 const byte DNS_PORT = 53;
 
-extern "C" int ieee80211_raw_frame_sanity_check(int32_t arg, int32_t arg2, int32_t arg3) {
-  return 0;
+// ESP32 core 3.x already defines ieee80211_raw_frame_sanity_check (strong symbol).
+// Do NOT redefine it — use linker --wrap (see build_opt.h) instead.
+extern "C" int __wrap_ieee80211_raw_frame_sanity_check(int32_t arg, int32_t arg2, int32_t arg3) {
+  (void)arg; (void)arg2; (void)arg3;
+  return 0;  // allow raw deauth / management frames
 }
 
 // --- Frame templates ---
