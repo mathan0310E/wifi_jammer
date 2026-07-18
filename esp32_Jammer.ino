@@ -1,21 +1,4 @@
-/*
- * Wolf Attacker — ESP32 WiFi Deauther / Jammer (Pro)
- * AP: Wolf Attacker / Tamil123
- * Open: http://google.com (captive) or http://192.168.4.1
- *
- * Features:
- *  - Scan / multi-select / attack one / attack all
- *  - Modes: DEAUTH, DISASSOC, BOTH, BEACON SPAM, PROBE SPAM
- *  - Intensity, TX power, attack timer (auto-stop)
- *  - Channel filter, min RSSI filter, select open nets
- *  - Bidirectional deauth frames, reason code
- *  - Clone selected SSIDs in beacon spam
- *  - Live stats, SoftAP client count, free heap, reboot
- *  - White UI + red buttons, captive portal
- *  - Optional NRF24 (USE_NRF24 1) + build_opt.h wrap fix
- *
- * LEGAL: Use only on networks you own / are authorized to test.
- */
+
 
 #include <WiFi.h>
 #include <WebServer.h>
